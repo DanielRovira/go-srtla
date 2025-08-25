@@ -195,7 +195,7 @@ func registerGroup(addr *net.UDPAddr, pkt []byte) {
 	groups = append(groups, g)
 	groupsMu.Unlock()
 
-	log.Printf("[%s] [Group %p] registered", addr, g)
+	log.Printf("[%s] [group %p] registered", addr, g)
 }
 
 func registerConn(addr *net.UDPAddr, pkt []byte) {
@@ -212,7 +212,7 @@ func registerConn(addr *net.UDPAddr, pkt []byte) {
 	// Reject if this addr is already tied to another group
 	if tmp, _ := findByAddr(addr); tmp != nil && tmp != g {
 		sendRegErr(addr)
-		log.Printf("[%s] [Group %p] conn reg failed: addr in other group", addr, g)
+		log.Printf("[%s] [group %p] conn reg failed: addr in other group", addr, g)
 		return
 	}
 
@@ -232,7 +232,7 @@ func registerConn(addr *net.UDPAddr, pkt []byte) {
 		if len(g.conns) >= MaxConnsPerGroup {
 			g.mu.Unlock()
 			sendRegErr(addr)
-			log.Printf("[%s] [Group %p] conn reg failed: too many conns", addr, g)
+			log.Printf("[%s] [group %p] conn reg failed: too many conns", addr, g)
 			return
 		}
 		g.conns = append(g.conns, &Conn{addr: addr, lastRcvd: time.Now()})
@@ -247,7 +247,7 @@ func registerConn(addr *net.UDPAddr, pkt []byte) {
 	binary.BigEndian.PutUint16(hdr[:], SRTLATypeReg3)
 	_, _ = srtlaSock.WriteToUDP(hdr[:], addr)
 
-	log.Printf("[%s] [Group %p] conn registered", addr, g)
+	log.Printf("[%s] [group %p] conn registered", addr, g)
 }
 
 func startSRTReader(g *Group) {
@@ -262,7 +262,7 @@ func startSRTReader(g *Group) {
 			}
 			n, err := conn.Read(buf)
 			if err != nil {
-				log.Printf("[Group %p] SRT socket read error: %v", g, err)
+				log.Printf("[group %p] SRT socket read error: %v", g, err)
 				g.close()
 				removeGroup(g)
 				return
@@ -282,7 +282,7 @@ func handleSRTData(g *Group, pkt []byte) {
 		defer g.mu.Unlock()
 		for _, c := range g.conns {
 			if _, err := srtlaSock.WriteToUDP(pkt, c.addr); err != nil {
-				log.Printf("[%s] [Group %p] failed to fwd SRT ACK: %v", c.addr, g, err)
+				log.Printf("[%s] [group %p] failed to fwd SRT ACK: %v", c.addr, g, err)
 			}
 		}
 	} else {
@@ -292,7 +292,7 @@ func handleSRTData(g *Group, pkt []byte) {
 		g.mu.Unlock()
 		if dst != nil {
 			if _, err := srtlaSock.WriteToUDP(pkt, dst); err != nil {
-				log.Printf("[%s] [Group %p] failed to fwd SRT pkt: %v", dst, g, err)
+				log.Printf("[%s] [group %p] failed to fwd SRT pkt: %v", dst, g, err)
 			}
 		}
 	}
@@ -330,7 +330,7 @@ func handleSRTLAIncoming(pkt []byte, addr *net.UDPAddr) {
 		conn, err := net.DialUDP("udp", nil, srtAddr)
 		if err != nil {
 			g.mu.Unlock()
-			log.Printf("[Group %p] failed to dial SRT server: %v", g, err)
+			log.Printf("[group %p] failed to dial SRT server: %v", g, err)
 			removeGroup(g)
 			return
 		}
@@ -340,7 +340,7 @@ func handleSRTLAIncoming(pkt []byte, addr *net.UDPAddr) {
 		g.srtSock = conn
 		g.mu.Unlock()
 		startSRTReader(g)
-		log.Printf("[Group %p] created SRT socket (local %s)", g, conn.LocalAddr())
+		log.Printf("[group %p] created SRT socket (local %s)", g, conn.LocalAddr())
 	} else {
 		g.mu.Unlock()
 	}
@@ -354,7 +354,7 @@ func handleSRTLAIncoming(pkt []byte, addr *net.UDPAddr) {
 
 	_, err := srtConn.Write(pkt)
 	if err != nil {
-		log.Printf("[Group %p] failed to fwd SRTLA pkt: %v", g, err)
+		log.Printf("[group %p] failed to fwd SRTLA pkt: %v", g, err)
 		g.close()
 		removeGroup(g)
 	}
@@ -375,7 +375,7 @@ func cleanup() {
 			if now.Sub(c.lastRcvd) < ConnTimeout {
 				newConns = append(newConns, c)
 			} else {
-				log.Printf("[%s] [Group %p] connection timed out", c.addr, g)
+				log.Printf("[%s] [group %p] connection timed out", c.addr, g)
 			}
 		}
 		if len(newConns) != len(g.conns) {
@@ -392,7 +392,7 @@ func cleanup() {
 		if keep {
 			newGroups = append(newGroups, g)
 		} else {
-			log.Printf("[Group %p] removed (no connections)", g)
+			log.Printf("[group %p] removed (no connections)", g)
 			g.close()
 		}
 	}
@@ -454,9 +454,9 @@ func main() {
 	var err error
 	srtAddr, err = resolveSRTAddr(*srtHost, uint16(*srtPort))
 	if err != nil {
-		log.Fatalf("could not resolve SRT server: %v", err)
+		log.Fatalf("could not resolve downstream SRT server: %v", err)
 	}
-	log.Printf("using SRT server %s", srtAddr)
+	log.Printf("downstream SRT server %s", srtAddr)
 
 	// Listen UDP (dual-stack) for SRT-LA
 	laddr := &net.UDPAddr{IP: net.IPv6unspecified, Port: int(*srtlaPort)}
@@ -467,7 +467,7 @@ func main() {
 	_ = srtlaSock.SetReadBuffer(RecvBufSize)
 	_ = srtlaSock.SetWriteBuffer(SendBufSize)
 
-	log.Printf("go-srtla running – listening on %s", srtlaSock.LocalAddr())
+	log.Printf("listening on %s", srtlaSock.LocalAddr())
 
 	// Reader goroutine for SRT-LA socket
 	go func() {
