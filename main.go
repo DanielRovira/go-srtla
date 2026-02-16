@@ -18,7 +18,10 @@ const (
 
 	SRTTypeHandshake = 0x8000
 	SRTTypeACK       = 0x8002
+	SRTTypeNAK       = 0x8003
 	SRTTypeShutdown  = 0x8005
+
+	SRTMinLen = 16
 
 	SRTLATypeKeepalive = 0x9000
 	SRTLATypeACK       = 0x9100
@@ -33,17 +36,17 @@ const (
 	SRTLAReg2Len = 2 + SRTLAIDLen
 	SRTLAReg3Len = 2
 
-	RecvACKInterval = 10 // number of pkts before sending SRT-LA ACK
+	RecvACKInterval = 10 // number of pkts before sending SRTLA ACK
 
 	MaxConnsPerGroup = 16
 	MaxGroups        = 200
 
 	CleanupPeriod = 3 * time.Second
-	GroupTimeout  = 10 * time.Second
-	ConnTimeout   = 10 * time.Second
+	GroupTimeout  = 4 * time.Second
+	ConnTimeout   = 4 * time.Second
 
-	SendBufSize = 32 * 1024 * 1024 // 32 MB
-	RecvBufSize = 32 * 1024 * 1024
+	SendBufSize = 100 * 1024 * 1024 // 100 MB (matches C++)
+	RecvBufSize = 100 * 1024 * 1024
 )
 
 func constantTimeCompare(a, b []byte) bool {
@@ -60,8 +63,6 @@ func constantTimeCompare(a, b []byte) bool {
 func randomBytes(n int) []byte {
 	b := make([]byte, n)
 	if _, err := io.ReadFull(rand.Reader, b); err != nil {
-		// crypto/rand should never fail on *nix, fall back to math/rand if it
-		// ever does.
 		log.Printf("warning: crypto/rand failed (%v); falling back to pseudo-rand", err)
 		for i := range b {
 			b[i] = byte(mathrand.Intn(256))
@@ -80,6 +81,10 @@ func udpAddrEqual(a, b *net.UDPAddr) bool {
 type Conn struct {
 	addr     *net.UDPAddr
 	lastRcvd time.Time
+
+	// SRTLA ACK tracking
+	recvLog [RecvACKInterval]uint32
+	recvIdx int
 }
 
 type Group struct {
@@ -88,7 +93,7 @@ type Group struct {
 	createdAt time.Time
 	srtSock   *net.UDPConn // connection to downstream SRT server
 	lastAddr  *net.UDPAddr // most recently active client addr
-	mu        sync.Mutex   // protects conns + lastAddr + srtSock
+	mu        sync.Mutex   // protects conns, lastAddr, srtSock
 }
 
 var (
@@ -100,6 +105,7 @@ var (
 )
 
 func be16(b []byte) uint16 { return binary.BigEndian.Uint16(b) }
+func be32(b []byte) uint32 { return binary.BigEndian.Uint32(b) }
 
 func getSRTType(pkt []byte) uint16 {
 	if len(pkt) < 2 {
@@ -108,7 +114,19 @@ func getSRTType(pkt []byte) uint16 {
 	return be16(pkt[:2])
 }
 
+func getSRTSeqNo(pkt []byte) int32 {
+	if len(pkt) < 4 {
+		return -1
+	}
+	sn := be32(pkt[:4])
+	if sn&(1<<31) != 0 {
+		return -1 // control packet
+	}
+	return int32(sn)
+}
+
 func isSRTAck(pkt []byte) bool         { return getSRTType(pkt) == SRTTypeACK }
+func isSRTNak(pkt []byte) bool         { return getSRTType(pkt) == SRTTypeNAK }
 func isSRTLAKeepalive(pkt []byte) bool { return getSRTType(pkt) == SRTLATypeKeepalive }
 
 func isSRTLAReg1(pkt []byte) bool {
@@ -133,14 +151,18 @@ func findByAddr(addr *net.UDPAddr) (g *Group, c *Conn) {
 	groupsMu.RLock()
 	defer groupsMu.RUnlock()
 	for _, gr := range groups {
+		gr.mu.Lock()
 		for _, conn := range gr.conns {
 			if udpAddrEqual(conn.addr, addr) {
+				gr.mu.Unlock()
 				return gr, conn
 			}
 		}
 		if udpAddrEqual(gr.lastAddr, addr) {
+			gr.mu.Unlock()
 			return gr, nil
 		}
+		gr.mu.Unlock()
 	}
 	return nil, nil
 }
@@ -167,7 +189,6 @@ func registerGroup(addr *net.UDPAddr, pkt []byte) {
 		return
 	}
 
-	// Prevent duplicate registration from same remote addr
 	if g, _ := findByAddr(addr); g != nil {
 		log.Printf("[%s] registration failed: addr already in group", addr)
 		sendRegErr(addr)
@@ -178,10 +199,8 @@ func registerGroup(addr *net.UDPAddr, pkt []byte) {
 	copy(clientID, pkt[2:])
 	g := newGroup(clientID)
 
-	// store last addr so that no other group can register from it
 	g.lastAddr = addr
 
-	// build REG2
 	out := make([]byte, SRTLAReg2Len)
 	binary.BigEndian.PutUint16(out[:2], SRTLATypeReg2)
 	copy(out[2:], g.id[:])
@@ -209,7 +228,6 @@ func registerConn(addr *net.UDPAddr, pkt []byte) {
 		return
 	}
 
-	// Reject if this addr is already tied to another group
 	if tmp, _ := findByAddr(addr); tmp != nil && tmp != g {
 		sendRegErr(addr)
 		log.Printf("[%s] [group %p] conn reg failed: addr in other group", addr, g)
@@ -219,7 +237,6 @@ func registerConn(addr *net.UDPAddr, pkt []byte) {
 	var already bool
 
 	g.mu.Lock()
-	// Check for existing connection entry
 	for _, c := range g.conns {
 		if udpAddrEqual(c.addr, addr) {
 			already = true
@@ -227,7 +244,6 @@ func registerConn(addr *net.UDPAddr, pkt []byte) {
 		}
 	}
 
-	// Add new connection if necessary
 	if !already {
 		if len(g.conns) >= MaxConnsPerGroup {
 			g.mu.Unlock()
@@ -238,11 +254,9 @@ func registerConn(addr *net.UDPAddr, pkt []byte) {
 		g.conns = append(g.conns, &Conn{addr: addr, lastRcvd: time.Now()})
 	}
 
-	// Update most-recent peer
 	g.lastAddr = addr
 	g.mu.Unlock()
 
-	// Send REG3 response
 	var hdr [2]byte
 	binary.BigEndian.PutUint16(hdr[:], SRTLATypeReg3)
 	_, _ = srtlaSock.WriteToUDP(hdr[:], addr)
@@ -263,7 +277,6 @@ func startSRTReader(g *Group) {
 			n, err := conn.Read(buf)
 			if err != nil {
 				log.Printf("[group %p] SRT socket read error: %v", g, err)
-				g.close()
 				removeGroup(g)
 				return
 			}
@@ -273,20 +286,21 @@ func startSRTReader(g *Group) {
 }
 
 func handleSRTData(g *Group, pkt []byte) {
-	if len(pkt) < 4 {
+	if len(pkt) < SRTMinLen {
 		return
 	}
-	if isSRTAck(pkt) {
-		// broadcast ACK to all conns
+
+	if isSRTAck(pkt) || isSRTNak(pkt) {
 		g.mu.Lock()
-		defer g.mu.Unlock()
-		for _, c := range g.conns {
+		conns := make([]*Conn, len(g.conns))
+		copy(conns, g.conns)
+		g.mu.Unlock()
+		for _, c := range conns {
 			if _, err := srtlaSock.WriteToUDP(pkt, c.addr); err != nil {
-				log.Printf("[%s] [group %p] failed to fwd SRT ACK: %v", c.addr, g, err)
+				log.Printf("[%s] [group %p] failed to fwd SRT ACK/NAK: %v", c.addr, g, err)
 			}
 		}
 	} else {
-		// send via last active conn
 		g.mu.Lock()
 		dst := g.lastAddr
 		g.mu.Unlock()
@@ -298,9 +312,29 @@ func handleSRTData(g *Group, pkt []byte) {
 	}
 }
 
-func handleSRTLAIncoming(pkt []byte, addr *net.UDPAddr) {
-	now := time.Now()
+func registerPacket(g *Group, c *Conn, sn int32) {
+	idx := c.recvIdx + 1
+	if idx <= 0 || idx > RecvACKInterval {
+		idx = 1
+	}
+	c.recvIdx = idx
+	c.recvLog[idx-1] = uint32(sn)
 
+	if c.recvIdx == RecvACKInterval {
+		// Build SRTLA ACK: 4-byte header + 10 * 4-byte sequence numbers
+		var ack [4 + RecvACKInterval*4]byte
+		binary.BigEndian.PutUint32(ack[:4], uint32(SRTLATypeACK)<<16)
+		for i := 0; i < RecvACKInterval; i++ {
+			binary.BigEndian.PutUint32(ack[4+i*4:], c.recvLog[i])
+		}
+		if _, err := srtlaSock.WriteToUDP(ack[:], c.addr); err != nil {
+			log.Printf("[%s] [group %p] failed to send SRTLA ACK: %v", c.addr, g, err)
+		}
+		c.recvIdx = 0
+	}
+}
+
+func handleSRTLAIncoming(pkt []byte, addr *net.UDPAddr) {
 	if isSRTLAReg1(pkt) {
 		registerGroup(addr, pkt)
 		return
@@ -312,19 +346,24 @@ func handleSRTLAIncoming(pkt []byte, addr *net.UDPAddr) {
 
 	g, c := findByAddr(addr)
 	if g == nil || c == nil {
-		return // not part of any group
+		return
 	}
 
-	c.lastRcvd = now
+	g.mu.Lock()
+	c.lastRcvd = time.Now()
 	g.lastAddr = addr
+	g.mu.Unlock()
 
 	if isSRTLAKeepalive(pkt) {
-		// echo back
 		srtlaSock.WriteToUDP(pkt, addr)
 		return
 	}
 
-	// Forward to SRT socket, creating it if needed
+	if len(pkt) < SRTMinLen {
+		return
+	}
+
+	// Ensure SRT downstream socket exists
 	g.mu.Lock()
 	if g.srtSock == nil {
 		conn, err := net.DialUDP("udp", nil, srtAddr)
@@ -334,7 +373,6 @@ func handleSRTLAIncoming(pkt []byte, addr *net.UDPAddr) {
 			removeGroup(g)
 			return
 		}
-		// increase buffers
 		_ = conn.SetReadBuffer(RecvBufSize)
 		_ = conn.SetWriteBuffer(SendBufSize)
 		g.srtSock = conn
@@ -352,10 +390,17 @@ func handleSRTLAIncoming(pkt []byte, addr *net.UDPAddr) {
 		return
 	}
 
+	// Track sequence number and send SRTLA ACK every RecvACKInterval packets
+	sn := getSRTSeqNo(pkt)
+	if sn >= 0 {
+		g.mu.Lock()
+		registerPacket(g, c, sn)
+		g.mu.Unlock()
+	}
+
 	_, err := srtConn.Write(pkt)
 	if err != nil {
 		log.Printf("[group %p] failed to fwd SRTLA pkt: %v", g, err)
-		g.close()
 		removeGroup(g)
 	}
 }
@@ -369,7 +414,6 @@ func cleanup() {
 	var newGroups []*Group
 	for _, g := range groups {
 		g.mu.Lock()
-		// remove stale conns
 		var newConns []*Conn
 		for _, c := range g.conns {
 			if now.Sub(c.lastRcvd) < ConnTimeout {
@@ -382,10 +426,17 @@ func cleanup() {
 			g.conns = newConns
 		}
 
-		// decide if group should stay
 		keep := true
 		if len(g.conns) == 0 && now.Sub(g.createdAt) > GroupTimeout {
 			keep = false
+		}
+
+		if !keep {
+			// Close while still holding g.mu to avoid double-lock in close()
+			if g.srtSock != nil {
+				g.srtSock.Close()
+				g.srtSock = nil
+			}
 		}
 		g.mu.Unlock()
 
@@ -393,11 +444,31 @@ func cleanup() {
 			newGroups = append(newGroups, g)
 		} else {
 			log.Printf("[group %p] removed (no connections)", g)
-			g.close()
 		}
 	}
 	groups = newGroups
 }
+
+// srt_handshake_t layout (64 bytes total):
+//
+//	Offset  0: srt_header_t (16 bytes)
+//	  [0:2]   type          = 0x8000 (handshake)
+//	  [2:4]   subtype
+//	  [4:8]   info
+//	  [8:12]  timestamp
+//	  [12:16] dest_id
+//	Offset 16: version       (4 bytes)
+//	Offset 20: enc_field     (2 bytes)
+//	Offset 22: ext_field     (2 bytes)
+//	Offset 24: initial_seq   (4 bytes)
+//	Offset 28: mtu           (4 bytes)
+//	Offset 32: mfw           (4 bytes)
+//	Offset 36: handshake_type(4 bytes)
+//	Offset 40: source_id     (4 bytes)
+//	Offset 44: syn_cookie    (4 bytes)
+//	Offset 48: peer_ip       (16 bytes)
+//	Total: 64 bytes
+const srtHandshakeLen = 64
 
 func resolveSRTAddr(host string, port uint16) (*net.UDPAddr, error) {
 	addrs, err := net.LookupIP(host)
@@ -405,11 +476,11 @@ func resolveSRTAddr(host string, port uint16) (*net.UDPAddr, error) {
 		return nil, err
 	}
 
-	hsPkt := make([]byte, 48) // sizeof(srt_handshake_t) in original code
-	binary.BigEndian.PutUint16(hsPkt[0:], SRTTypeHandshake)
-	binary.BigEndian.PutUint32(hsPkt[4:], 4)  // version
-	binary.BigEndian.PutUint16(hsPkt[8:], 2)  // ext field
-	binary.BigEndian.PutUint32(hsPkt[12:], 1) // handshake type = induction
+	hsPkt := make([]byte, srtHandshakeLen)
+	binary.BigEndian.PutUint16(hsPkt[0:], SRTTypeHandshake) // header.type
+	binary.BigEndian.PutUint32(hsPkt[16:], 4)               // version
+	binary.BigEndian.PutUint16(hsPkt[22:], 2)               // ext_field
+	binary.BigEndian.PutUint32(hsPkt[36:], 1)               // handshake_type = induction
 
 	for _, ip := range addrs {
 		raddr := &net.UDPAddr{IP: ip, Port: int(port)}
@@ -422,18 +493,34 @@ func resolveSRTAddr(host string, port uint16) (*net.UDPAddr, error) {
 		if err == nil {
 			buf := make([]byte, MTU)
 			n, err := conn.Read(buf)
-			if err == nil && n == len(hsPkt) {
+			if err == nil && n == srtHandshakeLen {
 				conn.Close()
 				return raddr, nil
 			}
 		}
 		conn.Close()
 	}
-	// Fallback to first IP even if handshake failed
 	if len(addrs) == 0 {
 		return nil, fmt.Errorf("no IPs for host %s", host)
 	}
 	return &net.UDPAddr{IP: addrs[0], Port: int(port)}, nil
+}
+
+func removeGroup(g *Group) {
+	groupsMu.Lock()
+	defer groupsMu.Unlock()
+	for i, gg := range groups {
+		if gg == g {
+			groups = append(groups[:i], groups[i+1:]...)
+			break
+		}
+	}
+	g.mu.Lock()
+	if g.srtSock != nil {
+		g.srtSock.Close()
+		g.srtSock = nil
+	}
+	g.mu.Unlock()
 }
 
 func main() {
@@ -458,7 +545,6 @@ func main() {
 	}
 	log.Printf("downstream SRT server %s", srtAddr)
 
-	// Listen UDP (dual-stack) for SRT-LA
 	laddr := &net.UDPAddr{IP: net.IPv6unspecified, Port: int(*srtlaPort)}
 	srtlaSock, err = net.ListenUDP("udp", laddr)
 	if err != nil {
@@ -469,7 +555,6 @@ func main() {
 
 	log.Printf("listening on %s", srtlaSock.LocalAddr())
 
-	// Reader goroutine for SRT-LA socket
 	go func() {
 		buf := make([]byte, MTU)
 		for {
@@ -484,31 +569,8 @@ func main() {
 		}
 	}()
 
-	// Periodic cleanup ticker
 	ticker := time.NewTicker(CleanupPeriod)
 	for range ticker.C {
 		cleanup()
-	}
-}
-
-// removeGroup deletes the group from global slice and frees its resources.
-func removeGroup(g *Group) {
-	groupsMu.Lock()
-	defer groupsMu.Unlock()
-	for i, gg := range groups {
-		if gg == g {
-			groups = append(groups[:i], groups[i+1:]...)
-			break
-		}
-	}
-	g.close()
-}
-
-func (g *Group) close() {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	if g.srtSock != nil {
-		g.srtSock.Close()
-		g.srtSock = nil
 	}
 }
