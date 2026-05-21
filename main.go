@@ -38,15 +38,15 @@ const (
 
 	RecvACKInterval = 10 // number of pkts before sending SRTLA ACK
 
-	MaxConnsPerGroup = 16
+	MaxConnsPerGroup = 32
 	MaxGroups        = 200
 
 	CleanupPeriod = 3 * time.Second
-	GroupTimeout  = 4 * time.Second
-	ConnTimeout   = 4 * time.Second
+	GroupTimeout  = 15 * time.Second
+	ConnTimeout   = 15 * time.Second
 
-	SendBufSize = 100 * 1024 * 1024 // 100 MB (matches C++)
-	RecvBufSize = 100 * 1024 * 1024
+	SendBufSize = 300 * 1024 * 1024 // 100 MB (matches C++)
+	RecvBufSize = 300 * 1024 * 1024
 )
 
 func constantTimeCompare(a, b []byte) bool {
@@ -78,6 +78,12 @@ func udpAddrEqual(a, b *net.UDPAddr) bool {
 	return a.IP.Equal(b.IP) && a.Port == b.Port
 }
 
+type OrderedPacket struct {
+    seqNo   int32
+    data    []byte
+    time    time.Time
+}
+
 type Conn struct {
 	addr     *net.UDPAddr
 	lastRcvd time.Time
@@ -94,6 +100,8 @@ type Group struct {
 	srtSock   *net.UDPConn // connection to downstream SRT server
 	lastAddr  *net.UDPAddr // most recently active client addr
 	mu        sync.Mutex   // protects conns, lastAddr, srtSock
+	reorderBuffer map[int32][]byte  // Buffer de reordenação
+    nextSeq       int32              // Próximo sequência esperada
 }
 
 var (
@@ -220,22 +228,50 @@ func registerGroup(addr *net.UDPAddr, pkt []byte) {
 func registerConn(addr *net.UDPAddr, pkt []byte) {
 	id := pkt[2:]
 	g := findGroupByID(id)
+
+	// SE NÃO EXISTIR GRUPO, CRIA UM NOVO AUTOMATICAMENTE
 	if g == nil {
-		var hdr [2]byte
-		binary.BigEndian.PutUint16(hdr[:], SRTLATypeRegNGP)
-		srtlaSock.WriteToUDP(hdr[:], addr)
-		log.Printf("[%s] conn registration failed: no group", addr)
-		return
+		log.Printf("[%s] grupo não encontrado para ID %x, recriando automaticamente...", addr, id)
+
+		// Verifica limite máximo de grupos
+		groupsMu.Lock()
+		if len(groups) >= MaxGroups {
+			groupsMu.Unlock()
+			log.Printf("[%s] não foi possível recriar: máximo de grupos atingido", addr)
+			var hdr [2]byte
+			binary.BigEndian.PutUint16(hdr[:], SRTLATypeRegNGP)
+			srtlaSock.WriteToUDP(hdr[:], addr)
+			return
+		}
+
+		// Cria novo grupo com o ID recebido
+		g = &Group{}
+		g.createdAt = time.Now()
+		copy(g.id[:], id[:SRTLAIDLen])
+
+		// Adiciona à lista de grupos
+		groups = append(groups, g)
+		groupsMu.Unlock()
+
+		// Envia resposta REG2 confirmando o novo grupo
+		out := make([]byte, SRTLAReg2Len)
+		binary.BigEndian.PutUint16(out[:2], SRTLATypeReg2)
+		copy(out[2:], g.id[:])
+		srtlaSock.WriteToUDP(out, addr)
+
+		log.Printf("[%s] [group %p] grupo recriado com sucesso após timeout", addr, g)
+		// Continua a execução para registrar a conexão
 	}
 
+	// Verifica se o endereço já está em outro grupo
 	if tmp, _ := findByAddr(addr); tmp != nil && tmp != g {
 		sendRegErr(addr)
-		log.Printf("[%s] [group %p] conn reg failed: addr in other group", addr, g)
+		log.Printf("[%s] [group %p] falha no registro: endereço em outro grupo", addr, g)
 		return
 	}
 
+	// Registra a conexão
 	var already bool
-
 	g.mu.Lock()
 	for _, c := range g.conns {
 		if udpAddrEqual(c.addr, addr) {
@@ -248,7 +284,7 @@ func registerConn(addr *net.UDPAddr, pkt []byte) {
 		if len(g.conns) >= MaxConnsPerGroup {
 			g.mu.Unlock()
 			sendRegErr(addr)
-			log.Printf("[%s] [group %p] conn reg failed: too many conns", addr, g)
+			log.Printf("[%s] [group %p] falha no registro: muitas conexões", addr, g)
 			return
 		}
 		g.conns = append(g.conns, &Conn{addr: addr, lastRcvd: time.Now()})
@@ -257,11 +293,12 @@ func registerConn(addr *net.UDPAddr, pkt []byte) {
 	g.lastAddr = addr
 	g.mu.Unlock()
 
+	// Envia REG3 confirmando conexão
 	var hdr [2]byte
 	binary.BigEndian.PutUint16(hdr[:], SRTLATypeReg3)
-	_, _ = srtlaSock.WriteToUDP(hdr[:], addr)
+	srtlaSock.WriteToUDP(hdr[:], addr)
 
-	log.Printf("[%s] [group %p] conn registered", addr, g)
+	log.Printf("[%s] [group %p] conexão registrada com sucesso", addr, g)
 }
 
 func startSRTReader(g *Group) {
@@ -285,12 +322,9 @@ func startSRTReader(g *Group) {
 	}()
 }
 
-func handleSRTData(g *Group, pkt []byte) {
-	if len(pkt) < SRTMinLen {
-		return
-	}
-
+func sendToClients(g *Group, pkt []byte) {
 	if isSRTAck(pkt) || isSRTNak(pkt) {
+		// Broadcast ACK/NAK para todos os clientes
 		g.mu.Lock()
 		conns := make([]*Conn, len(g.conns))
 		copy(conns, g.conns)
@@ -301,6 +335,7 @@ func handleSRTData(g *Group, pkt []byte) {
 			}
 		}
 	} else {
+		// Envia para o último cliente ativo
 		g.mu.Lock()
 		dst := g.lastAddr
 		g.mu.Unlock()
@@ -310,6 +345,35 @@ func handleSRTData(g *Group, pkt []byte) {
 			}
 		}
 	}
+}
+
+func handleSRTData(g *Group, pkt []byte) {
+    // Extrai número de sequência
+    seqNo := getSRTSeqNo(pkt)
+    if seqNo < 0 {
+        // Pacote de controle, envia imediatamente
+        sendToClients(g, pkt)
+        return
+    }
+    
+    // Adiciona ao buffer de reordenação
+    g.mu.Lock()
+    if g.reorderBuffer == nil {
+        g.reorderBuffer = make(map[int32][]byte)
+    }
+    g.reorderBuffer[seqNo] = pkt
+    
+    // Envia pacotes em ordem
+    for {
+        data, ok := g.reorderBuffer[g.nextSeq]
+        if !ok {
+            break
+        }
+        sendToClients(g, data)
+        delete(g.reorderBuffer, g.nextSeq)
+        g.nextSeq++
+    }
+    g.mu.Unlock()
 }
 
 func registerPacket(g *Group, c *Conn, sn int32) {
