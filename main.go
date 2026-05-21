@@ -38,15 +38,15 @@ const (
 
 	RecvACKInterval = 10 // number of pkts before sending SRTLA ACK
 
-	MaxConnsPerGroup = 32
+	MaxConnsPerGroup = 4
 	MaxGroups        = 200
 
 	CleanupPeriod = 3 * time.Second
-	GroupTimeout  = 15 * time.Second
-	ConnTimeout   = 15 * time.Second
+	GroupTimeout  = 30 * time.Second
+	ConnTimeout   = 30 * time.Second
 
-	SendBufSize = 300 * 1024 * 1024 // 100 MB (matches C++)
-	RecvBufSize = 300 * 1024 * 1024
+	SendBufSize = 100 * 1024 * 1024 // 100 MB (matches C++)
+	RecvBufSize = 100 * 1024 * 1024
 )
 
 func constantTimeCompare(a, b []byte) bool {
@@ -79,9 +79,9 @@ func udpAddrEqual(a, b *net.UDPAddr) bool {
 }
 
 type OrderedPacket struct {
-    seqNo   int32
-    data    []byte
-    time    time.Time
+	seqNo int32
+	data  []byte
+	time  time.Time
 }
 
 type Conn struct {
@@ -94,14 +94,15 @@ type Conn struct {
 }
 
 type Group struct {
-	id        [SRTLAIDLen]byte
-	conns     []*Conn
-	createdAt time.Time
-	srtSock   *net.UDPConn // connection to downstream SRT server
-	lastAddr  *net.UDPAddr // most recently active client addr
-	mu        sync.Mutex   // protects conns, lastAddr, srtSock
-	reorderBuffer map[int32][]byte  // Buffer de reordenação
-    nextSeq       int32              // Próximo sequência esperada
+	id            [SRTLAIDLen]byte
+	conns         []*Conn
+	createdAt     time.Time
+	srtSock       *net.UDPConn     // connection to downstream SRT server
+	lastAddr      *net.UDPAddr     // most recently active client addr
+	mu            sync.Mutex       // protects conns, lastAddr, srtSock
+	reorderBuffer map[int32][]byte // Armazena pacotes fora de ordem
+	nextSeq       int32            // Próximo número de sequência esperado
+	muReorder     sync.Mutex       // Mutex específico para reordenação
 }
 
 var (
@@ -178,7 +179,8 @@ func findByAddr(addr *net.UDPAddr) (g *Group, c *Conn) {
 func newGroup(clientID []byte) *Group {
 	var g Group
 	g.createdAt = time.Now()
-
+	g.reorderBuffer = make(map[int32][]byte) // <-- ADICIONE ESTA LINHA
+	g.nextSeq = 0
 	copy(g.id[:SRTLAIDLen/2], clientID)
 	copy(g.id[SRTLAIDLen/2:], randomBytes(SRTLAIDLen/2))
 	return &g
@@ -348,32 +350,61 @@ func sendToClients(g *Group, pkt []byte) {
 }
 
 func handleSRTData(g *Group, pkt []byte) {
-    // Extrai número de sequência
-    seqNo := getSRTSeqNo(pkt)
-    if seqNo < 0 {
-        // Pacote de controle, envia imediatamente
-        sendToClients(g, pkt)
-        return
-    }
-    
-    // Adiciona ao buffer de reordenação
-    g.mu.Lock()
-    if g.reorderBuffer == nil {
-        g.reorderBuffer = make(map[int32][]byte)
-    }
-    g.reorderBuffer[seqNo] = pkt
-    
-    // Envia pacotes em ordem
-    for {
-        data, ok := g.reorderBuffer[g.nextSeq]
-        if !ok {
-            break
-        }
-        sendToClients(g, data)
-        delete(g.reorderBuffer, g.nextSeq)
-        g.nextSeq++
-    }
-    g.mu.Unlock()
+	if len(pkt) < SRTMinLen {
+		return
+	}
+
+	// Verifica se é pacote de controle (ACK/NAK)
+	if isSRTAck(pkt) || isSRTNak(pkt) {
+		// Pacotes de controle vão imediatamente (sem reordenação)
+		g.mu.Lock()
+		conns := make([]*Conn, len(g.conns))
+		copy(conns, g.conns)
+		g.mu.Unlock()
+		for _, c := range conns {
+			if _, err := srtlaSock.WriteToUDP(pkt, c.addr); err != nil {
+				log.Printf("[%s] [group %p] failed to fwd SRT ACK/NAK: %v", c.addr, g, err)
+			}
+		}
+		return
+	}
+
+	// Extrai número de sequência
+	seqNo := getSRTSeqNo(pkt)
+	if seqNo < 0 {
+		// Pacote sem sequência, envia direto
+		g.mu.Lock()
+		dst := g.lastAddr
+		g.mu.Unlock()
+		if dst != nil {
+			srtlaSock.WriteToUDP(pkt, dst)
+		}
+		return
+	}
+
+	// REORDENAÇÃO: guarda pacote no buffer
+	g.muReorder.Lock()
+	g.reorderBuffer[seqNo] = pkt
+
+	// Envia pacotes em ordem
+	for {
+		data, ok := g.reorderBuffer[g.nextSeq]
+		if !ok {
+			break
+		}
+		// Envia pacote ordenado
+		g.mu.Lock()
+		dst := g.lastAddr
+		g.mu.Unlock()
+		if dst != nil {
+			if _, err := srtlaSock.WriteToUDP(data, dst); err != nil {
+				log.Printf("[group %p] failed to fwd ordered pkt: %v", g, err)
+			}
+		}
+		delete(g.reorderBuffer, g.nextSeq)
+		g.nextSeq++
+	}
+	g.muReorder.Unlock()
 }
 
 func registerPacket(g *Group, c *Conn, sn int32) {
@@ -496,6 +527,9 @@ func cleanup() {
 		}
 
 		if !keep {
+			g.muReorder.Lock()
+			g.reorderBuffer = nil
+			g.muReorder.Unlock()
 			// Close while still holding g.mu to avoid double-lock in close()
 			if g.srtSock != nil {
 				g.srtSock.Close()
